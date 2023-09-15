@@ -8,6 +8,7 @@ import json
 
 
 app = Flask(__name__)
+app.config['JSON_SORT_KEYS'] = False
 
 parser = argparse.ArgumentParser(description="An example of using server.cpp with a similar API to OAI. It must be used together with server.cpp.")
 parser.add_argument("--chat-prompt", type=str, help="the top prompt in chat completions(default: 'A chat between a curious user and an artificial intelligence assistant. The assistant follows the given rules no matter what.\\n')", default='A chat between a curious user and an artificial intelligence assistant. The assistant follows the given rules no matter what.\\n')
@@ -115,6 +116,72 @@ def make_resData(data, chat=False, promptToken=[]):
         }]
     return resData
 
+def make_resData_v2(data, chat=False):
+    resData = {
+        "id": "chatcmpl" if (chat) else "cmpl",
+        "object": "chat.completion" if (chat) else "text_completion",
+        "created": int(time.time()),
+        "model": "LLaMA_CPP"
+    }
+
+    if (chat):
+        #only one choice is supported
+        resData["choices"] = [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": data["content"],
+            },
+            "finish_reason": "stop" if (data["stopped_eos"] or data["stopped_word"]) else "length"
+        }]
+    else:
+        #only one choice is supported
+        resData["choices"] = [{
+            "text": data["content"],
+            "index": 0,
+            "logprobs": None,
+            "finish_reason": "stop" if (data["stopped_eos"] or data["stopped_word"]) else "length"
+        }]
+
+    resData["usage"] = [{
+        "prompt_tokens": data["tokens_evaluated"],
+        "completion_tokens": data["tokens_predicted"],
+        "total_tokens": data["tokens_evaluated"] + data["tokens_predicted"]
+    }]
+    return resData
+
+def make_resData_stream_v2(data, chat=False, time_now = 0, start=False):
+    resData = {
+        "id": "chatcmpl" if (chat) else "cmpl",
+        "object": "chat.completion.chunk" if (chat) else "text_completion.chunk",
+        "created": time_now,
+        "model": "LLaMA_CPP",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": None,
+                "logprobs": None
+            }
+        ]
+    }
+    if (chat):
+        if (start):
+            resData["choices"][0]["delta"] =  {
+                "role": "assistant"
+            }
+        else:
+            resData["choices"][0]["delta"] =  {
+                "content": data["content"]
+            }
+            if (data["stop"]):
+                resData["choices"][0]["finish_reason"] = "stop" if (data["stopped_eos"] or data["stopped_word"]) else "length"
+    else:
+        resData["choices"][0]["text"] = data["content"]
+        if (data["stop"]):
+            resData["choices"][0]["finish_reason"] = "stop" if (data["stopped_eos"] or data["stopped_word"]) else "length"
+
+    return resData
+
 def make_resData_stream(data, chat=False, time_now = 0, start=False):
     resData = {
         "id": "chatcmpl" if (chat) else "cmpl",
@@ -213,6 +280,33 @@ def completion():
                 if line:
                     decoded_line = line.decode('utf-8')
                     resData = make_resData_stream(json.loads(decoded_line[6:]), chat=False, time_now=time_now)
+                    yield 'data: {}\n'.format(json.dumps(resData))
+        return Response(generate(), mimetype='text/event-stream')
+
+
+@app.route('/v2/completions', methods=['POST'])
+def completion_v2():
+    if (args.api_key != "" and request.headers["Authorization"].split()[1] != args.api_key):
+        return Response(status=403)
+    body = request.get_json()
+    stream = False
+    tokenize = False
+    if(is_present(body, "stream")): stream = body["stream"]
+    postData = make_postData(body, chat=False, stream=stream)
+
+    if (not stream):
+        data = requests.request("POST", urllib.parse.urljoin(args.llama_api, "/completion"), data=json.dumps(postData))
+        print(data.json())
+        resData = make_resData_v2(data.json(), chat=False)
+        return jsonify(resData)
+    else:
+        def generate():
+            data = requests.request("POST", urllib.parse.urljoin(args.llama_api, "/completion"), data=json.dumps(postData), stream=True)
+            time_now = int(time.time())
+            for line in data.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    resData = make_resData_stream_v2(json.loads(decoded_line[6:]), chat=False, time_now=time_now)
                     yield 'data: {}\n'.format(json.dumps(resData))
         return Response(generate(), mimetype='text/event-stream')
 

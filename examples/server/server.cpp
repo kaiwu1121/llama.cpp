@@ -1008,6 +1008,7 @@ static json format_generation_settings(llama_server_context &llama)
         {"temp", llama.params.temp},
         {"top_k", llama.params.top_k},
         {"top_p", llama.params.top_p},
+        {"n", llama.params.n},
         {"tfs_z", llama.params.tfs_z},
         {"typical_p", llama.params.typical_p},
         {"repeat_last_n", llama.params.repeat_last_n},
@@ -1019,13 +1020,14 @@ static json format_generation_settings(llama_server_context &llama)
         {"mirostat_eta", llama.params.mirostat_eta},
         {"penalize_nl", llama.params.penalize_nl},
         {"stop", llama.params.antiprompt},
-        {"n_predict", llama.params.n_predict},
+        {"max_tokens", llama.params.n_predict},  // n_predict --> max_tokens
         {"n_keep", llama.params.n_keep},
         {"ignore_eos", ignore_eos},
         {"stream", llama.stream},
         {"logit_bias", llama.params.logit_bias},
         {"n_probs", llama.params.n_probs},
         {"grammar", llama.params.grammar},
+        {"echo", llama.params.echo},
     };
 }
 
@@ -1083,6 +1085,45 @@ static json format_final_response(llama_server_context &llama, const std::string
     return res;
 }
 
+static json format_final_response_v2(llama_server_context &llama, const std::string &content)
+{
+    json res;
+
+    res["id"] = "cmpl";
+    res["object"] = "text_completion";
+    res["created"] = static_cast<int>(std::time(nullptr));
+    res["model"] = llama.params.model;  // "LLaMA_CPP";
+
+    json choice;
+    choice["index"] = 0;
+
+    // double check the concept
+    std::string final_conext = content;
+    if (!llama.params.suffix.empty())
+    {
+        final_conext += llama.params.suffix; 
+    }
+    else if (llama.params.echo)
+    {
+        final_conext += llama.params.prompt; 
+    }
+
+    choice["text"] = final_conext;
+
+    choice["logprobs"] = nullptr;
+
+    choice["finish_reason"] = (llama.stopped_eos || llama.stopped_word) ? "stop" : "length";
+    res["choices"] = {choice};
+
+    json usage;
+    usage["prompt_tokens"] = llama.num_prompt_tokens;
+    usage["completion_tokens"] = llama.num_tokens_predicted;
+    usage["total_tokens"] = llama.num_prompt_tokens + llama.num_tokens_predicted;
+    res["usage"] = {usage};
+
+    return res;
+}
+
 static json format_partial_response(llama_server_context &llama, const std::string &content, const std::vector<completion_token_output> &probs)
 {
     json res = json{
@@ -1096,6 +1137,11 @@ static json format_partial_response(llama_server_context &llama, const std::stri
     }
 
     return res;
+}
+
+static json format_partial_response_v2(llama_server_context &llama, const std::string &content)
+{
+    return format_final_response_v2(llama, content);
 }
 
 static json format_tokenizer_response(const std::vector<llama_token> &tokens)
@@ -1124,9 +1170,10 @@ static void parse_options_completion(const json &body, llama_server_context &lla
     gpt_params default_params;
 
     llama.stream = json_value(body, "stream", false);
-    llama.params.n_predict = json_value(body, "n_predict", default_params.n_predict);
+    llama.params.n_predict = json_value(body, "max_tokens", default_params.n_predict);  // n_predict -> max_tokens
     llama.params.top_k = json_value(body, "top_k", default_params.top_k);
     llama.params.top_p = json_value(body, "top_p", default_params.top_p);
+    llama.params.n = json_value(body, "n", default_params.n);
     llama.params.tfs_z = json_value(body, "tfs_z", default_params.tfs_z);
     llama.params.typical_p = json_value(body, "typical_p", default_params.typical_p);
     llama.params.repeat_last_n = json_value(body, "repeat_last_n", default_params.repeat_last_n);
@@ -1142,6 +1189,7 @@ static void parse_options_completion(const json &body, llama_server_context &lla
     llama.params.seed = json_value(body, "seed", default_params.seed);
     llama.params.grammar = json_value(body, "grammar", default_params.grammar);
     llama.params.n_probs = json_value(body, "n_probs", default_params.n_probs);
+    llama.params.echo = json_value(body, "echo", default_params.echo);
 
     if (body.count("prompt") != 0)
     {
@@ -1150,6 +1198,15 @@ static void parse_options_completion(const json &body, llama_server_context &lla
     else
     {
         llama.prompt = "";
+    }
+
+    if (body.count("suffix") != 0)
+    {
+        llama.params.suffix = body["suffix"];
+    }
+    else
+    {
+        llama.params.suffix = "";
     }
 
     llama.params.logit_bias.clear();
@@ -1466,6 +1523,168 @@ int main(int argc, char **argv)
                             llama,
                             "",
                             std::vector<completion_token_output>(llama.generated_token_probs.begin(), llama.generated_token_probs.begin() + sent_token_probs_index)
+                        );
+
+                        const std::string str =
+                            "data: " +
+                            data.dump(-1, ' ', false, json::error_handler_t::replace) +
+                            "\n\n";
+
+                        LOG_VERBOSE("data stream", {
+                            { "to_send", str }
+                        });
+
+                        if (!sink.write(str.data(), str.size())) {
+                            LOG_VERBOSE("stream closed", {});
+                            llama_print_timings(llama.ctx);
+                            return false;
+                        }
+                    }
+                }
+
+                llama_print_timings(llama.ctx);
+                sink.done();
+                return true;
+            };
+            const auto on_complete = [&](bool) {
+                llama.mutex.unlock();
+            };
+            lock.release();
+            res.set_chunked_content_provider("text/event-stream", chunked_content_provider, on_complete);
+        } });
+
+    svr.Post("/v2/completion", [&llama](const Request &req, Response &res)
+             {
+        auto lock = llama.lock();
+
+        llama.rewind();
+
+        llama_reset_timings(llama.ctx);
+
+        parse_options_completion(json::parse(req.body), llama);
+
+        if (!llama.loadGrammar())
+        {
+            res.status = 400;
+            return;
+        }
+
+        llama.loadPrompt();
+        llama.beginCompletion();
+
+        if (!llama.stream) {
+            if (llama.params.n_beams) {
+                // Fill llama.generated_token_probs vector with final beam.
+                llama_beam_search(llama.ctx, beam_search_callback, &llama, llama.params.n_beams,
+                                  llama.n_past, llama.n_remain, llama.params.n_threads);
+                // Translate llama.generated_token_probs to llama.generated_text.
+                append_to_generated_text_from_generated_token_probs(llama);
+            } else {
+                size_t stop_pos = std::string::npos;
+
+                while (llama.has_next_token) {
+                    const completion_token_output token_with_probs = llama.doCompletion();
+                    const std::string token_text = token_with_probs.tok == -1 ? "" : llama_token_to_piece(llama.ctx, token_with_probs.tok);
+
+                    stop_pos = llama.findStoppingStrings(llama.generated_text,
+                        token_text.size(), STOP_FULL);
+                }
+
+                if (stop_pos == std::string::npos) {
+                    stop_pos = llama.findStoppingStrings(llama.generated_text, 0, STOP_PARTIAL);
+                }
+                if (stop_pos != std::string::npos) {
+                    llama.generated_text.erase(llama.generated_text.begin() + stop_pos,
+                        llama.generated_text.end());
+                }
+            }
+
+            auto probs = llama.generated_token_probs;
+            if (llama.params.n_probs > 0 && llama.stopped_word) {
+                const std::vector<llama_token> stop_word_toks = llama_tokenize(llama.ctx, llama.stopping_word, false);
+                probs = std::vector<completion_token_output>(llama.generated_token_probs.begin(), llama.generated_token_probs.end() - stop_word_toks.size());
+            }
+
+            const json data = format_final_response_v2(llama, llama.generated_text);
+
+            llama_print_timings(llama.ctx);
+
+            res.set_content(data.dump(-1, ' ', false, json::error_handler_t::replace),
+                            "application/json");
+        } else {
+            const auto chunked_content_provider = [&](size_t, DataSink & sink) {
+                size_t sent_count = 0;
+                size_t sent_token_probs_index = 0;
+
+                while (llama.has_next_token) {
+                    const completion_token_output token_with_probs = llama.doCompletion();
+                    if (token_with_probs.tok == -1 || llama.multibyte_pending > 0) {
+                        continue;
+                    }
+                    const std::string token_text = llama_token_to_piece(llama.ctx, token_with_probs.tok);
+
+                    size_t pos = std::min(sent_count, llama.generated_text.size());
+
+                    const std::string str_test = llama.generated_text.substr(pos);
+                    bool is_stop_full = false;
+                    size_t stop_pos =
+                        llama.findStoppingStrings(str_test, token_text.size(), STOP_FULL);
+                    if (stop_pos != std::string::npos) {
+                        is_stop_full = true;
+                        llama.generated_text.erase(
+                            llama.generated_text.begin() + pos + stop_pos,
+                            llama.generated_text.end());
+                        pos = std::min(sent_count, llama.generated_text.size());
+                    } else {
+                        is_stop_full = false;
+                        stop_pos = llama.findStoppingStrings(str_test, token_text.size(),
+                            STOP_PARTIAL);
+                    }
+
+                    if (
+                        stop_pos == std::string::npos ||
+                        // Send rest of the text if we are at the end of the generation
+                        (!llama.has_next_token && !is_stop_full && stop_pos > 0)
+                    ) {
+                        const std::string to_send = llama.generated_text.substr(pos, std::string::npos);
+
+                        sent_count += to_send.size();
+
+                        std::vector<completion_token_output> probs_output = {};
+
+                        if (llama.params.n_probs > 0) {
+                            const std::vector<llama_token> to_send_toks = llama_tokenize(llama.ctx, to_send, false);
+                            size_t probs_pos = std::min(sent_token_probs_index, llama.generated_token_probs.size());
+                            size_t probs_stop_pos = std::min(sent_token_probs_index + to_send_toks.size(), llama.generated_token_probs.size());
+                            if (probs_pos < probs_stop_pos) {
+                                probs_output = std::vector<completion_token_output>(llama.generated_token_probs.begin() + probs_pos, llama.generated_token_probs.begin() + probs_stop_pos);
+                            }
+                            sent_token_probs_index = probs_stop_pos;
+                        }
+
+                        const json data = format_partial_response_v2(llama, to_send);
+
+                        const std::string str =
+                            "data: " +
+                            data.dump(-1, ' ', false, json::error_handler_t::replace) +
+                            "\n\n";
+
+                        LOG_VERBOSE("data stream", {
+                            { "to_send", str }
+                        });
+
+                        if (!sink.write(str.data(), str.size())) {
+                            LOG_VERBOSE("stream closed", {});
+                            llama_print_timings(llama.ctx);
+                            return false;
+                        }
+                    }
+
+                    if (!llama.has_next_token) {
+                        // Generation is done, send extra information.
+                        const json data = format_final_response_v2(
+                            llama,
+                            ""
                         );
 
                         const std::string str =
